@@ -1,10 +1,9 @@
-require "forwardable"
-
 module Searchkick
   class Results
     include Enumerable
     extend Forwardable
 
+    # TODO remove klass and options in 6.0
     attr_reader :klass, :response, :options
 
     def_delegators :results, :each, :any?, :empty?, :size, :length, :slice, :[], :to_ary
@@ -15,17 +14,16 @@ module Searchkick
       @options = options
     end
 
+    # TODO make private in 6.0
     def results
       @results ||= with_hit.map(&:first)
     end
 
-    # TODO return enumerator like with_score
     def with_hit
-      @with_hit ||= begin
-        if missing_records.any?
-          Searchkick.warn("Records in search index do not exist in database: #{missing_records.map { |v| v[:id] }.join(", ")}")
-        end
-        with_hit_and_missing_records[0]
+      return enum_for(:with_hit) unless block_given?
+
+      build_hits.each do |result|
+        yield result
       end
     end
 
@@ -145,7 +143,7 @@ module Searchkick
 
     def hits
       if error
-        raise Searchkick::Error, "Query error - use the error method to view it"
+        raise Error, "Query error - use the error method to view it"
       else
         @response["hits"]["hits"]
       end
@@ -157,10 +155,11 @@ module Searchkick
       end
     end
 
-    # TODO return enumerator like with_score
     def with_highlights(multiple: false)
-      with_hit.map do |result, hit|
-        [result, hit_highlights(hit, multiple: multiple)]
+      return enum_for(:with_highlights, multiple: multiple) unless block_given?
+
+      with_hit.each do |result, hit|
+        yield result, hit_highlights(hit, multiple: multiple)
       end
     end
 
@@ -181,7 +180,7 @@ module Searchkick
     end
 
     def scroll
-      raise Searchkick::Error, "Pass `scroll` option to the search method for scrolling" unless scroll_id
+      raise Error, "Pass `scroll` option to the search method for scrolling" unless scroll_id
 
       if block_given?
         records = self
@@ -194,10 +193,10 @@ module Searchkick
       else
         begin
           # TODO Active Support notifications for this scroll call
-          Searchkick::Results.new(@klass, Searchkick.client.scroll(scroll: options[:scroll], body: {scroll_id: scroll_id}), @options)
-        rescue Elasticsearch::Transport::Transport::Errors::NotFound => e
-          if e.class.to_s =~ /NotFound/ && e.message =~ /search_context_missing_exception/i
-            raise Searchkick::Error, "Scroll id has expired"
+          Results.new(@klass, Searchkick.client.scroll(scroll: options[:scroll], body: {scroll_id: scroll_id}), @options)
+        rescue => e
+          if Searchkick.not_found_error?(e) && e.message =~ /search_context_missing_exception/i
+            raise Error, "Scroll id has expired"
           else
             raise e
           end
@@ -211,8 +210,8 @@ module Searchkick
         # not required as scroll will expire
         # but there is a cost to open scrolls
         Searchkick.client.clear_scroll(scroll_id: scroll_id)
-      rescue Elasticsearch::Transport::Transport::Error
-        # do nothing
+      rescue => e
+        raise e unless Searchkick.transport_error?(e)
       end
     end
 
@@ -235,7 +234,7 @@ module Searchkick
                 index_alias = index.split("_")[0..-2].join("_")
                 Array((options[:index_mapping] || {})[index_alias])
               end
-            raise Searchkick::Error, "Unknown model for index: #{index}. Pass the `models` option to the search method." unless models.any?
+            raise Error, "Unknown model for index: #{index}. Pass the `models` option to the search method." unless models.any?
             index_models[index] = models
           end
 
@@ -287,7 +286,7 @@ module Searchkick
                 end
 
               if hit["highlight"] || options[:highlight]
-                highlight = Hash[hit["highlight"].to_a.map { |k, v| [base_field(k), v.first] }]
+                highlight = hit["highlight"].to_a.to_h { |k, v| [base_field(k), v.first] }
                 options[:highlighted_fields].map { |k| base_field(k) }.each do |k|
                   result["highlighted_#{k}"] ||= (highlight[k] || result[k])
                 end
@@ -302,23 +301,25 @@ module Searchkick
       end
     end
 
+    def build_hits
+      @build_hits ||= begin
+        if missing_records.any?
+          Searchkick.warn("Records in search index do not exist in database: #{missing_records.map { |v| "#{Array(v[:model]).map(&:model_name).sort.join("/")} #{v[:id]}" }.join(", ")}")
+        end
+        with_hit_and_missing_records[0]
+      end
+    end
+
     def results_query(records, hits)
+      records = Searchkick.scope(records)
+
       ids = hits.map { |hit| hit["_id"] }
       if options[:includes] || options[:model_includes]
         included_relations = []
         combine_includes(included_relations, options[:includes])
         combine_includes(included_relations, options[:model_includes][records]) if options[:model_includes]
 
-        records =
-          if defined?(NoBrainer::Document) && records < NoBrainer::Document
-            if Gem.loaded_specs["nobrainer"].version >= Gem::Version.new("0.21")
-              records.eager_load(included_relations)
-            else
-              records.preload(included_relations)
-            end
-          else
-            records.includes(included_relations)
-          end
+        records = records.includes(included_relations)
       end
 
       if options[:scope_results]
@@ -344,7 +345,7 @@ module Searchkick
 
     def hit_highlights(hit, multiple: false)
       if hit["highlight"]
-        Hash[hit["highlight"].map { |k, v| [(options[:json] ? k : k.sub(/\.#{@options[:match_suffix]}\z/, "")).to_sym, multiple ? v : v.first] }]
+        hit["highlight"].to_h { |k, v| [(options[:json] ? k : k.sub(/\.#{@options[:match_suffix]}\z/, "")).to_sym, multiple ? v : v.first] }
       else
         {}
       end

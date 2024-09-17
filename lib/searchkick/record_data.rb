@@ -25,6 +25,7 @@ module Searchkick
       {delete: record_data}
     end
 
+    # custom id can be useful for load: false
     def search_id
       id = record.respond_to?(:search_document_id) ? record.search_document_id : record.id
       id.is_a?(Numeric) ? id : id.to_s
@@ -39,7 +40,6 @@ module Searchkick
         _index: index.name,
         _id: search_id
       }
-      data[:_type] = document_type if Searchkick.server_below7?
       data[:routing] = record.search_routing if record.respond_to?(:search_routing)
       data
     end

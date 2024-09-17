@@ -2,8 +2,8 @@ require_relative "test_helper"
 
 class InheritanceTest < Minitest::Test
   def setup
-    skip if cequel?
     super
+    setup_animal
   end
 
   def test_child_reindex
@@ -13,7 +13,7 @@ class InheritanceTest < Minitest::Test
   end
 
   def test_child_index_name
-    assert_equal "animals-#{Date.today.year}#{ENV["TEST_ENV_NUMBER"]}", Dog.searchkick_index.name
+    assert_equal "animals_test#{ENV["TEST_ENV_NUMBER"]}", Dog.searchkick_index.name
   end
 
   def test_child_search
@@ -81,6 +81,23 @@ class InheritanceTest < Minitest::Test
     assert_equal 2, Searchkick.search("bear", models: [Cat, Dog]).size
   end
 
+  def test_missing_records
+    store_names ["Bear A"], Cat
+    store_names ["Bear B"], Dog
+    Animal.reindex
+    record = Animal.find_by(name: "Bear A")
+    record.delete
+    assert_output nil, /\[searchkick\] WARNING: Records in search index do not exist in database: Cat\/Dog \d+/ do
+      result = Searchkick.search("bear", models: [Cat, Dog])
+      assert_equal ["Bear B"], result.map(&:name)
+      assert_equal [record.id.to_s], result.missing_records.map { |v| v[:id] }
+      assert_equal [[Cat, Dog]], result.missing_records.map { |v| v[:model].sort_by(&:model_name) }
+    end
+    assert_empty Product.search("bear", load: false).missing_records
+  ensure
+    Animal.reindex
+  end
+
   def test_inherited_and_non_inherited_models
     store_names ["Bear A"], Cat
     store_names ["Bear B"], Dog
@@ -119,5 +136,15 @@ class InheritanceTest < Minitest::Test
       Searchkick.search("product", index_name: [Product.searchkick_index.name]).map(&:name)
     end
     assert_includes error.message, "Unknown model"
+  end
+
+  def test_similar
+    store_names ["Dog", "Other dog"], Dog
+    store_names ["Not dog"], Cat
+
+    dog = Dog.find_by!(name: "Dog")
+    assert_equal ["Other dog"], dog.similar(fields: [:name]).map(&:name)
+    assert_equal ["Not dog", "Other dog"], dog.similar(fields: [:name], models: [Animal]).map(&:name).sort
+    assert_equal ["Not dog"], dog.similar(fields: [:name], models: [Cat]).map(&:name).sort
   end
 end

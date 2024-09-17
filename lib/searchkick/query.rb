@@ -1,5 +1,6 @@
 module Searchkick
   class Query
+    include Enumerable
     extend Forwardable
 
     @@metric_aggs = [:avg, :cardinality, :max, :min, :sum]
@@ -8,16 +9,17 @@ module Searchkick
     attr_accessor :body
 
     def_delegators :execute, :map, :each, :any?, :empty?, :size, :length, :slice, :[], :to_ary,
-      :records, :results, :suggestions, :each_with_hit, :with_details, :aggregations, :aggs,
+      :results, :suggestions, :each_with_hit, :with_details, :aggregations, :aggs,
       :took, :error, :model_name, :entry_name, :total_count, :total_entries,
       :current_page, :per_page, :limit_value, :padding, :total_pages, :num_pages,
       :offset_value, :offset, :previous_page, :prev_page, :next_page, :first_page?, :last_page?,
-      :out_of_range?, :hits, :response, :to_a, :first, :scroll
+      :out_of_range?, :hits, :response, :to_a, :first, :scroll, :highlights, :with_highlights,
+      :with_score, :misspellings?, :scroll_id, :clear_scroll, :missing_records, :with_hit
 
     def initialize(klass, term = "*", **options)
       unknown_keywords = options.keys - [:aggs, :block, :body, :body_options, :boost,
-        :boost_by, :boost_by_distance, :boost_by_recency, :boost_where, :conversions, :conversions_term, :debug, :emoji, :exclude, :execute, :explain,
-        :fields, :highlight, :includes, :index_name, :indices_boost, :limit, :load,
+        :boost_by, :boost_by_distance, :boost_by_recency, :boost_where, :conversions, :conversions_term, :debug, :emoji, :exclude, :explain,
+        :fields, :highlight, :includes, :index_name, :indices_boost, :knn, :limit, :load,
         :match, :misspellings, :models, :model_includes, :offset, :operator, :order, :padding, :page, :per_page, :profile,
         :request_params, :routing, :scope_results, :scroll, :select, :similar, :smart_aggs, :suggest, :total_entries, :track, :type, :where]
       raise ArgumentError, "unknown keywords: #{unknown_keywords.join(", ")}" if unknown_keywords.any?
@@ -73,7 +75,8 @@ module Searchkick
         elsif searchkick_index
           searchkick_index.name
         else
-          "_all"
+          # fixes warning about accessing system indices
+          "*,-.*"
         end
 
       params = {
@@ -110,7 +113,7 @@ module Searchkick
 
       # no easy way to tell which host the client will use
       host =
-        if Gem::Version.new(Elasticsearch::VERSION) >= Gem::Version.new("7.14.0")
+        if Searchkick.client.transport.respond_to?(:transport)
           Searchkick.client.transport.transport.hosts.first
         else
           Searchkick.client.transport.hosts.first
@@ -145,9 +148,6 @@ module Searchkick
       }
 
       if options[:debug]
-        # can remove when minimum Ruby version is 2.5
-        require "pp"
-
         puts "Searchkick Version: #{Searchkick::VERSION}"
         puts "Elasticsearch Version: #{Searchkick.server_version}"
         puts
@@ -187,11 +187,11 @@ module Searchkick
       end
 
       # set execute for multi search
-      @execute = Searchkick::Results.new(searchkick_klass, response, opts)
+      @execute = Results.new(searchkick_klass, response, opts)
     end
 
     def retry_misspellings?(response)
-      @misspellings_below && Searchkick::Results.new(searchkick_klass, response).total_count < @misspellings_below
+      @misspellings_below && response["error"].nil? && Results.new(searchkick_klass, response).total_count < @misspellings_below
     end
 
     private
@@ -199,7 +199,11 @@ module Searchkick
     def handle_error(e)
       status_code = e.message[1..3].to_i
       if status_code == 404
-        raise MissingIndexError, "Index missing - run #{reindex_command}"
+        if e.message.include?("No search context found for id")
+          raise MissingIndexError, "No search context found for id"
+        else
+          raise MissingIndexError, "Index missing - run #{reindex_command}"
+        end
       elsif status_code == 500 && (
         e.message.include?("IllegalArgumentException[minimumSimilarity >= 1]") ||
         e.message.include?("No query registered for [multi_match]") ||
@@ -207,15 +211,15 @@ module Searchkick
         e.message.include?("No query registered for [function_score]")
       )
 
-        raise UnsupportedVersionError, "This version of Searchkick requires Elasticsearch 5 or greater"
+        raise UnsupportedVersionError
       elsif status_code == 400
         if (
           e.message.include?("bool query does not support [filter]") ||
           e.message.include?("[bool] filter does not support [filter]")
         )
 
-          raise UnsupportedVersionError, "This version of Searchkick requires Elasticsearch 5 or greater"
-        elsif e.message =~ /analyzer \[searchkick_.+\] not found/
+          raise UnsupportedVersionError
+        elsif e.message.match?(/analyzer \[searchkick_.+\] not found/)
           raise InvalidQueryError, "Bad mapping - run #{reindex_command}"
         else
           raise InvalidQueryError, e.message
@@ -230,7 +234,14 @@ module Searchkick
     end
 
     def execute_search
-      Searchkick.client.search(params)
+      name = searchkick_klass ? "#{searchkick_klass.name} Search" : "Search"
+      event = {
+        name: name,
+        query: params
+      }
+      ActiveSupport::Notifications.instrument("search.searchkick", event) do
+        Searchkick.client.search(params)
+      end
     end
 
     def prepare
@@ -244,8 +255,15 @@ module Searchkick
       default_limit = searchkick_options[:deep_paging] ? 1_000_000_000 : 10_000
       per_page = (options[:limit] || options[:per_page] || default_limit).to_i
       padding = [options[:padding].to_i, 0].max
-      offset = options[:offset] || (page - 1) * per_page + padding
+      offset = (options[:offset] || (page - 1) * per_page + padding).to_i
       scroll = options[:scroll]
+
+      max_result_window = searchkick_options[:max_result_window]
+      original_per_page = per_page
+      if max_result_window
+        offset = max_result_window if offset > max_result_window
+        per_page = max_result_window - offset if offset + per_page > max_result_window
+      end
 
       # model and eager loading
       load = options[:load].nil? ? true : options[:load]
@@ -265,9 +283,10 @@ module Searchkick
         should = []
 
         if options[:similar]
+          like = options[:similar] == true ? term : options[:similar]
           query = {
             more_like_this: {
-              like: term,
+              like: like,
               min_doc_freq: 1,
               min_term_freq: 1,
               analyzer: "searchkick_search2"
@@ -355,7 +374,7 @@ module Searchkick
             field_misspellings = misspellings && (!misspellings_fields || misspellings_fields.include?(base_field(field)))
 
             if field == "_all" || field.end_with?(".analyzed")
-              shared_options[:cutoff_frequency] = 0.001 unless operator.to_s == "and" || field_misspellings == false || (!below73? && !track_total_hits?)
+              shared_options[:cutoff_frequency] = 0.001 unless operator.to_s == "and" || field_misspellings == false || (!below73? && !track_total_hits?) || match_type == :match_phrase || !below80? || Searchkick.opensearch?
               qs << shared_options.merge(analyzer: "searchkick_search")
 
               # searchkick_search and searchkick_search2 are the same for some languages
@@ -369,7 +388,7 @@ module Searchkick
               exclude_field = f
               exclude_analyzer = "keyword"
             else
-              analyzer = field =~ /\.word_(start|middle|end)\z/ ? "searchkick_word_search" : "searchkick_autocomplete_search"
+              analyzer = field.match?(/\.word_(start|middle|end)\z/) ? "searchkick_word_search" : "searchkick_autocomplete_search"
               qs << shared_options.merge(analyzer: analyzer)
               exclude_analyzer = analyzer
             end
@@ -380,11 +399,6 @@ module Searchkick
 
             if field.start_with?("*.")
               q2 = qs.map { |q| {multi_match: q.merge(fields: [field], type: match_type == :match_phrase ? "phrase" : "best_fields")} }
-              if below61?
-                q2.each do |q|
-                  q[:multi_match].delete(:fuzzy_transpositions)
-                end
-              end
             else
               q2 = qs.map { |q| {match_type => {field => q}} }
             end
@@ -436,7 +450,7 @@ module Searchkick
         payload = {}
 
         # type when inheritance
-        where = (options[:where] || {}).dup
+        where = ensure_permitted(options[:where] || {}).dup
         if searchkick_options[:inheritance] && (options[:type] || (klass != searchkick_klass && searchkick_index))
           where[:type] = [options[:type] || klass].flatten.map { |v| searchkick_index.klass_document_type(v, true) }
         end
@@ -496,7 +510,7 @@ module Searchkick
         set_highlights(payload, fields) if options[:highlight]
 
         # timeout shortly after client times out
-        payload[:timeout] ||= "#{Searchkick.search_timeout + 1}s"
+        payload[:timeout] ||= "#{((Searchkick.search_timeout + 1) * 1000).round}ms"
 
         # An empty array will cause only the _id and _type for each hit to be returned
         # https://www.elastic.co/guide/en/elasticsearch/reference/current/search-request-source-filtering.html
@@ -511,6 +525,9 @@ module Searchkick
           payload[:_source] = false
         end
       end
+
+      # knn
+      set_knn(payload, options[:knn], per_page, offset) if options[:knn]
 
       # pagination
       pagination_options = options[:page] || options[:limit] || options[:per_page] || options[:offset] || options[:padding]
@@ -545,7 +562,7 @@ module Searchkick
 
       @body = payload
       @page = page
-      @per_page = per_page
+      @per_page = original_per_page
       @padding = padding
       @load = load
       @scroll = scroll
@@ -693,9 +710,9 @@ module Searchkick
     def set_boost_by(multiply_filters, custom_filters)
       boost_by = options[:boost_by] || {}
       if boost_by.is_a?(Array)
-        boost_by = Hash[boost_by.map { |f| [f, {factor: 1}] }]
+        boost_by = boost_by.to_h { |f| [f, {factor: 1}] }
       elsif boost_by.is_a?(Hash)
-        multiply_by, boost_by = boost_by.partition { |_, v| v.delete(:boost_mode) == "multiply" }.map { |i| Hash[i] }
+        multiply_by, boost_by = boost_by.partition { |_, v| v.delete(:boost_mode) == "multiply" }.map(&:to_h)
       end
       boost_by[options[:boost]] = {factor: 1} if options[:boost]
 
@@ -760,7 +777,7 @@ module Searchkick
 
     def set_highlights(payload, fields)
       payload[:highlight] = {
-        fields: Hash[fields.map { |f| [f, {}] }],
+        fields: fields.to_h { |f| [f, {}] },
         fragment_size: 0
       }
 
@@ -794,7 +811,7 @@ module Searchkick
       aggs = options[:aggs]
       payload[:aggs] = {}
 
-      aggs = Hash[aggs.map { |f| [f, {}] }] if aggs.is_a?(Array) # convert to more advanced syntax
+      aggs = aggs.to_h { |f| [f, {}] } if aggs.is_a?(Array) # convert to more advanced syntax
       aggs.each do |field, agg_options|
         size = agg_options[:limit] ? agg_options[:limit] : 1_000
         shared_agg_options = agg_options.except(:limit, :field, :ranges, :date_ranges, :where)
@@ -833,8 +850,9 @@ module Searchkick
         end
 
         where = {}
-        where = (options[:where] || {}).reject { |k| k == field } unless options[:smart_aggs] == false
-        agg_filters = where_filters(where.merge(agg_options[:where] || {}))
+        where = ensure_permitted(options[:where] || {}).reject { |k| k == field } unless options[:smart_aggs] == false
+        agg_where = ensure_permitted(agg_options[:where] || {})
+        agg_filters = where_filters(where.merge(agg_where))
 
         # only do one level comparison for simplicity
         filters.select! do |filter|
@@ -861,6 +879,119 @@ module Searchkick
       end
     end
 
+    def set_knn(payload, knn, per_page, offset)
+      if term != "*"
+        raise ArgumentError, "Use Searchkick.multi_search for hybrid search"
+      end
+
+      field = knn[:field]
+      field_options = searchkick_options.dig(:knn, field.to_sym) || searchkick_options.dig(:knn, field.to_s) || {}
+      vector = knn[:vector]
+      distance = knn[:distance] || field_options[:distance]
+      exact = knn[:exact]
+      exact = field_options[:distance].nil? || distance != field_options[:distance] if exact.nil?
+      k = per_page + offset
+      filter = payload.delete(:query)
+
+      if distance.nil?
+        raise ArgumentError, "distance required"
+      elsif !exact && distance != field_options[:distance]
+        raise ArgumentError, "distance must match searchkick options for approximate search"
+      end
+
+      if Searchkick.opensearch?
+        if exact
+          # https://opensearch.org/docs/latest/search-plugins/knn/knn-score-script/#spaces
+          space_type =
+            case distance
+            when "cosine"
+              "cosinesimil"
+            when "euclidean"
+              "l2"
+            when "taxicab"
+              "l1"
+            when "inner_product"
+              "innerproduct"
+            when "chebyshev"
+              "linf"
+            else
+              raise ArgumentError, "Unknown distance: #{distance}"
+            end
+
+          payload[:query] = {
+            script_score: {
+              query: {
+                bool: {
+                  must: [filter, {exists: {field: field}}]
+                }
+              },
+              script: {
+                source: "knn_score",
+                lang: "knn",
+                params: {
+                  field: field,
+                  query_value: vector,
+                  space_type: space_type
+                }
+              },
+              boost: distance == "cosine" ? 0.5 : 1.0
+            }
+          }
+        else
+          payload[:query] = {
+            knn: {
+              field.to_sym => {
+                vector: vector,
+                k: k,
+                filter: filter
+              }
+            }
+          }
+        end
+      else
+        if exact
+          # https://github.com/elastic/elasticsearch/blob/main/docs/reference/vectors/vector-functions.asciidoc
+          source =
+            case distance
+            when "cosine"
+              "(cosineSimilarity(params.query_vector, params.field) + 1.0) * 0.5"
+            when "euclidean"
+              "double l2 = l2norm(params.query_vector, params.field); 1 / (1 + l2 * l2)"
+            when "taxicab"
+              "1 / (1 + l1norm(params.query_vector, params.field))"
+            when "inner_product"
+              "double dot = dotProduct(params.query_vector, params.field); dot > 0 ? dot + 1 : 1 / (1 - dot)"
+            else
+              raise ArgumentError, "Unknown distance: #{distance}"
+            end
+
+          payload[:query] = {
+            script_score: {
+              query: {
+                bool: {
+                  must: [filter, {exists: {field: field}}]
+                }
+              },
+              script: {
+                source: source,
+                params: {
+                  field: field,
+                  query_vector: vector
+                }
+              }
+            }
+          }
+        else
+          payload[:knn] = {
+            field: field,
+            query_vector: vector,
+            k: k,
+            filter: filter
+          }
+        end
+      end
+    end
+
     def set_post_filters(payload, post_filters)
       payload[:post_filter] = {
         bool: {
@@ -870,19 +1001,17 @@ module Searchkick
     end
 
     def set_order(payload)
-      order = options[:order].is_a?(Enumerable) ? options[:order] : {options[:order] => :asc}
-      id_field = :_id
-      # TODO no longer map id to _id in Searchkick 5
-      # since sorting on _id is deprecated in Elasticsearch
-      payload[:sort] = order.is_a?(Array) ? order : Hash[order.map { |k, v| [k.to_s == "id" ? id_field : k, v] }]
+      value = options[:order]
+      payload[:sort] = value.is_a?(Enumerable) ? value : {value => :asc}
+    end
+
+    # provides *very* basic protection from unfiltered parameters
+    # this is not meant to be comprehensive and may be expanded in the future
+    def ensure_permitted(obj)
+      obj.to_h
     end
 
     def where_filters(where)
-      # if where.respond_to?(:permitted?) && !where.permitted?
-      #   # TODO check in more places
-      #   Searchkick.warn("Passing unpermitted parameters will raise an exception in Searchkick 5")
-      # end
-
       filters = []
       (where || {}).each do |field, value|
         field = :_id if field.to_s == "id"
@@ -897,17 +1026,16 @@ module Searchkick
           filters << {bool: {must_not: where_filters(value)}}
         elsif field == :_and
           filters << {bool: {must: value.map { |or_statement| {bool: {filter: where_filters(or_statement)}} }}}
-        # elsif field == :_script
-        #   filters << {script: {script: {source: value, lang: "painless"}}}
+        elsif field == :_script
+          unless value.is_a?(Script)
+            raise TypeError, "expected Searchkick::Script"
+          end
+
+          filters << {script: {script: {source: value.source, lang: value.lang, params: value.params}}}
         else
           # expand ranges
           if value.is_a?(Range)
-            # infinite? added in Ruby 2.4
-            if value.end.nil? || (value.end.respond_to?(:infinite?) && value.end.infinite?)
-              value = {gte: value.first}
-            else
-              value = {gte: value.first, (value.exclude_end? ? :lt : :lte) => value.last}
-            end
+            value = expand_range(value)
           end
 
           value = {in: value} if value.is_a?(Array)
@@ -967,10 +1095,10 @@ module Searchkick
                 # \ is escape character
                 # escape Lucene reserved characters
                 # https://www.elastic.co/guide/en/elasticsearch/reference/current/regexp-syntax.html#regexp-optional-operators
-                reserved = %w(. ? + * | { } [ ] ( ) " \\)
+                reserved = %w(\\ . ? + * | { } [ ] ( ) ")
                 regex = op_value.dup
                 reserved.each do |v|
-                  regex.gsub!(v, "\\" + v)
+                  regex.gsub!(v, "\\\\" + v)
                 end
                 regex = regex.gsub(/(?<!\\)%/, ".*").gsub(/(?<!\\)_/, ".").gsub("\\%", "%").gsub("\\_", "_")
 
@@ -996,6 +1124,11 @@ module Searchkick
               when :in
                 filters << term_filters(field, op_value)
               when :exists
+                # TODO add support for false in Searchkick 6
+                if op_value != true
+                  # TODO raise error in Searchkick 6
+                  Searchkick.warn("Passing a value other than true to exists is not supported")
+                end
                 filters << {exists: {field: field}}
               else
                 range_query =
@@ -1009,7 +1142,7 @@ module Searchkick
                   when :lte
                     {to: op_value, include_upper: true}
                   else
-                    raise "Unknown where operator: #{op.inspect}"
+                    raise ArgumentError, "Unknown where operator: #{op.inspect}"
                   end
                 # issue 132
                 if (existing = filters.find { |f| f[:range] && f[:range][field] })
@@ -1038,29 +1171,25 @@ module Searchkick
         {bool: {must_not: {exists: {field: field}}}}
       elsif value.is_a?(Regexp)
         source = value.source
-        unless source.start_with?("\\A") && source.end_with?("\\z")
-          # https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl-regexp-query.html
-          Searchkick.warn("Regular expressions are always anchored in Elasticsearch")
-        end
+
+        # TODO handle other regexp options
 
         # TODO handle other anchor characters, like ^, $, \Z
         if source.start_with?("\\A")
           source = source[2..-1]
         else
-          # TODO uncomment in Searchkick 5
-          # source = ".*#{source}"
+          source = ".*#{source}"
         end
 
         if source.end_with?("\\z")
           source = source[0..-3]
         else
-          # TODO uncomment in Searchkick 5
-          # source = "#{source}.*"
+          source = "#{source}.*"
         end
 
         if below710?
           if value.casefold?
-            Searchkick.warn("Case-insensitive flag does not work with Elasticsearch < 7.10")
+            raise ArgumentError, "Case-insensitive flag does not work with Elasticsearch < 7.10"
           end
           {regexp: {field => {value: source, flags: "NONE"}}}
         else
@@ -1071,9 +1200,7 @@ module Searchkick
         if value.as_json.is_a?(Enumerable)
           # query will fail, but this is better
           # same message as Active Record
-          # TODO make TypeError
-          # raise InvalidQueryError for backward compatibility
-          raise Searchkick::InvalidQueryError, "can't cast #{value.class.name}"
+          raise TypeError, "can't cast #{value.class.name}"
         end
 
         {term: {field => {value: value}}}
@@ -1136,24 +1263,27 @@ module Searchkick
       end
     end
 
+    def expand_range(range)
+      expanded = {}
+      expanded[:gte] = range.begin if range.begin
+
+      if range.end && !(range.end.respond_to?(:infinite?) && range.end.infinite?)
+        expanded[range.exclude_end? ? :lt : :lte] = range.end
+      end
+
+      expanded
+    end
+
     def base_field(k)
       k.sub(/\.(analyzed|word_start|word_middle|word_end|text_start|text_middle|text_end|exact)\z/, "")
     end
 
     def track_total_hits?
-      (searchkick_options[:deep_paging] && !below70?) || body_options[:track_total_hits]
+      searchkick_options[:deep_paging] || body_options[:track_total_hits]
     end
 
     def body_options
       options[:body_options] || {}
-    end
-
-    def below61?
-      Searchkick.server_below?("6.1.0")
-    end
-
-    def below70?
-      Searchkick.server_below?("7.0.0")
     end
 
     def below73?
@@ -1166,6 +1296,10 @@ module Searchkick
 
     def below710?
       Searchkick.server_below?("7.10.0")
+    end
+
+    def below80?
+      Searchkick.server_below?("8.0.0")
     end
   end
 end

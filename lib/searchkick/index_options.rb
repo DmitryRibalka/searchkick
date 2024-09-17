@@ -7,21 +7,19 @@ module Searchkick
     end
 
     def index_options
-      custom_mapping = options[:mappings] || {}
-      if below70? && custom_mapping.keys.map(&:to_sym).include?(:properties)
-        # add type
-        custom_mapping = {index_type => custom_mapping}
-      end
+      # mortal symbols are garbage collected in Ruby 2.2+
+      custom_settings = (options[:settings] || {}).deep_symbolize_keys
+      custom_mappings = (options[:mappings] || {}).deep_symbolize_keys
 
       if options[:mappings] && !options[:merge_mappings]
-        settings = options[:settings] || {}
-        mappings = custom_mapping
+        settings = custom_settings
+        mappings = custom_mappings
       else
-        settings = generate_settings
-        mappings = generate_mappings.symbolize_keys.deep_merge(custom_mapping.symbolize_keys)
+        settings = generate_settings.deep_symbolize_keys.deep_merge(custom_settings)
+        mappings = generate_mappings.deep_symbolize_keys.deep_merge(custom_mappings)
       end
 
-      set_deep_paging(settings) if options[:deep_paging]
+      set_deep_paging(settings) if options[:deep_paging] || options[:max_result_window]
 
       {
         settings: settings,
@@ -162,16 +160,28 @@ module Searchkick
         settings[:number_of_replicas] = 0
       end
 
-      # TODO remove in Searchkick 5 (classic no longer supported)
       if options[:similarity]
         settings[:similarity] = {default: {type: options[:similarity]}}
       end
 
-      unless below62?
-        settings[:index] = {
-          max_ngram_diff: 49,
-          max_shingle_diff: 4
-        }
+      settings[:index] = {
+        max_ngram_diff: 49,
+        max_shingle_diff: 4
+      }
+
+      if options[:knn]
+        unless Searchkick.knn_support?
+          if Searchkick.opensearch?
+            raise Error, "knn requires OpenSearch 2.4+"
+          else
+            raise Error, "knn requires Elasticsearch 8.6+"
+          end
+        end
+
+        if Searchkick.opensearch? && options[:knn].any? { |_, v| !v[:distance].nil? }
+          # only enable if doing approximate search
+          settings[:index][:knn] = true
+        end
       end
 
       if options[:case_sensitive]
@@ -180,13 +190,8 @@ module Searchkick
         end
       end
 
-      # TODO do this last in Searchkick 5
-      settings = settings.symbolize_keys.deep_merge((options[:settings] || {}).symbolize_keys)
-
       add_synonyms(settings)
       add_search_synonyms(settings)
-      # TODO remove in Searchkick 5
-      add_wordnet(settings) if options[:wordnet]
 
       if options[:special_characters] == false
         settings[:analysis][:analyzer].each_value do |analyzer_settings|
@@ -223,19 +228,7 @@ module Searchkick
             type: "smartcn"
           }
         )
-      when "japanese"
-        settings[:analysis][:analyzer].merge!(
-          default_analyzer => {
-            type: "kuromoji"
-          },
-          searchkick_search: {
-            type: "kuromoji"
-          },
-          searchkick_search2: {
-            type: "kuromoji"
-          }
-        )
-      when "japanese2"
+      when "japanese", "japanese2"
         analyzer = {
           type: "custom",
           tokenizer: "kuromoji_tokenizer",
@@ -379,16 +372,15 @@ module Searchkick
         }
       end
 
-      mapping_options = Hash[
+      mapping_options =
         [:suggest, :word, :text_start, :text_middle, :text_end, :word_start, :word_middle, :word_end, :highlight, :searchable, :filterable]
-          .map { |type| [type, (options[type] || []).map(&:to_s)] }
-      ]
+          .to_h { |type| [type, (options[type] || []).map(&:to_s)] }
 
       word = options[:word] != false && (!options[:match] || options[:match] == :word)
 
       mapping_options[:searchable].delete("_all")
 
-      analyzed_field_options = {type: default_type, index: true, analyzer: default_analyzer}
+      analyzed_field_options = {type: default_type, index: true, analyzer: default_analyzer.to_s}
 
       mapping_options.values.flatten.uniq.each do |field|
         fields = {}
@@ -427,6 +419,66 @@ module Searchkick
       options[:geo_shape] = options[:geo_shape].product([{}]).to_h if options[:geo_shape].is_a?(Array)
       (options[:geo_shape] || {}).each do |field, shape_options|
         mapping[field] = shape_options.merge(type: "geo_shape")
+      end
+
+      (options[:knn] || []).each do |field, knn_options|
+        distance = knn_options[:distance]
+
+        if Searchkick.opensearch?
+          if distance.nil?
+            # avoid server crash if method not specified
+            raise ArgumentError, "Must specify a distance for OpenSearch"
+          end
+
+          vector_options = {
+            type: "knn_vector",
+            dimension: knn_options[:dimensions]
+          }
+
+          if !distance.nil?
+            space_type =
+              case distance
+              when "cosine"
+                "cosinesimil"
+              when "euclidean"
+                "l2"
+              when "inner_product"
+                "innerproduct"
+              else
+                raise ArgumentError, "Unknown distance: #{distance}"
+              end
+
+            vector_options[:method] = {
+              name: "hnsw",
+              space_type: space_type,
+              engine: "lucene"
+            }
+          end
+
+          mapping[field.to_s] = vector_options
+        else
+          vector_options = {
+            type: "dense_vector",
+            dims: knn_options[:dimensions],
+            index: !distance.nil?
+          }
+
+          if !distance.nil?
+            vector_options[:similarity] =
+              case distance
+              when "cosine"
+                "cosine"
+              when "euclidean"
+                "l2_norm"
+              when "inner_product"
+                "max_inner_product"
+              else
+                raise ArgumentError, "Unknown distance: #{distance}"
+              end
+          end
+
+          mapping[field.to_s] = vector_options
+        end
       end
 
       if options[:inheritance]
@@ -481,10 +533,6 @@ module Searchkick
         ]
       }
 
-      if below70?
-        mappings = {index_type => mappings}
-      end
-
       mappings
     end
 
@@ -533,14 +581,14 @@ module Searchkick
         end
         settings[:analysis][:filter][:searchkick_synonym_graph] = synonym_graph
 
-        if options[:language] == "japanese2"
+        if ["japanese", "japanese2"].include?(options[:language])
           [:searchkick_search, :searchkick_search2].each do |analyzer|
             settings[:analysis][:analyzer][analyzer][:filter].insert(4, "searchkick_synonym_graph")
           end
         else
           [:searchkick_search2, :searchkick_word_search].each do |analyzer|
             unless settings[:analysis][:analyzer][analyzer].key?(:filter)
-              raise Searchkick::Error, "Search synonyms are not supported yet for language"
+              raise Error, "Search synonyms are not supported yet for language"
             end
 
             settings[:analysis][:analyzer][analyzer][:filter].insert(2, "searchkick_synonym_graph")
@@ -549,25 +597,10 @@ module Searchkick
       end
     end
 
-    def add_wordnet(settings)
-      settings[:analysis][:filter][:searchkick_wordnet] = {
-        type: "synonym",
-        format: "wordnet",
-        synonyms_path: Searchkick.wordnet_path
-      }
-
-      settings[:analysis][:analyzer][default_analyzer][:filter].insert(4, "searchkick_wordnet")
-      settings[:analysis][:analyzer][default_analyzer][:filter] << "searchkick_wordnet"
-
-      %w(word_start word_middle word_end).each do |type|
-        settings[:analysis][:analyzer]["searchkick_#{type}_index".to_sym][:filter].insert(2, "searchkick_wordnet")
-      end
-    end
-
     def set_deep_paging(settings)
       if !settings.dig(:index, :max_result_window) && !settings[:"index.max_result_window"]
         settings[:index] ||= {}
-        settings[:index][:max_result_window] = 1_000_000_000
+        settings[:index][:max_result_window] = options[:max_result_window] || 1_000_000_000
       end
     end
 
@@ -585,14 +618,6 @@ module Searchkick
 
     def default_analyzer
       :searchkick_index
-    end
-
-    def below62?
-      Searchkick.server_below?("6.2.0")
-    end
-
-    def below70?
-      Searchkick.server_below?("7.0.0")
     end
 
     def below73?

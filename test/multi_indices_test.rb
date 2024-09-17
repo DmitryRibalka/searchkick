@@ -1,6 +1,11 @@
 require_relative "test_helper"
 
 class MultiIndicesTest < Minitest::Test
+  def setup
+    super
+    setup_speaker
+  end
+
   def test_basic
     store_names ["Product A"]
     store_names ["Product B"], Speaker
@@ -12,7 +17,7 @@ class MultiIndicesTest < Minitest::Test
     assert_equal ["Product A"], Product.search("product", index_name: Product.searchkick_index.name).map(&:name)
     assert_equal ["Product A"], Product.search("product", index_name: Product).map(&:name)
 
-    Speaker.search_index.refresh
+    Speaker.searchkick_index.refresh
     assert_equal [], Product.search("product", index_name: Speaker.searchkick_index.name, conversions: false).map(&:name)
   end
 

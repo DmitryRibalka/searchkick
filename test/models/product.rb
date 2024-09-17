@@ -20,11 +20,22 @@ class Product
     highlight: [:name],
     filterable: [:name, :color, :description],
     similarity: "BM25",
-    match: ENV["MATCH"] ? ENV["MATCH"].to_sym : nil
+    match: ENV["MATCH"] ? ENV["MATCH"].to_sym : nil,
+    knn: Searchkick.knn_support? ? {
+      embedding: {dimensions: 3, distance: "cosine"},
+      embedding2: {dimensions: 3, distance: "inner_product"},
+      factors: {dimensions: 3, distance: "euclidean"}
+    }.merge(Searchkick.opensearch? ? {} : {vector: {dimensions: 3}}) : nil
 
   attr_accessor :conversions, :user_ids, :aisle, :details
 
+  class << self
+    attr_accessor :dynamic_data
+  end
+
   def search_data
+    return self.class.dynamic_data.call if self.class.dynamic_data
+
     serializable_hash.except("id", "_id").merge(
       conversions: conversions,
       user_ids: user_ids,

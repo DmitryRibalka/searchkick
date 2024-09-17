@@ -32,6 +32,10 @@ ActiveRecord::Schema.define do
     t.decimal :longitude, precision: 10, scale: 7
     t.text :description
     t.text :alt_description
+    t.text :embedding
+    t.text :embedding2
+    t.text :factors
+    t.text :vector
     t.timestamps null: true
   end
 
@@ -63,11 +67,30 @@ ActiveRecord::Schema.define do
 
   create_table :bands do |t|
     t.string :name
+    t.boolean :active
+  end
+
+ create_table :artists do |t|
+    t.string :name
+    t.boolean :active
+    t.boolean :should_index
   end
 end
 
 class Product < ActiveRecord::Base
   belongs_to :store
+
+  if ActiveRecord::VERSION::STRING.to_f >= 7.1
+    serialize :embedding, coder: JSON
+    serialize :embedding2, coder: JSON
+    serialize :factors, coder: JSON
+    serialize :vector, coder: JSON
+  else
+    serialize :embedding, JSON
+    serialize :embedding2, JSON
+    serialize :factors, JSON
+    serialize :vector, JSON
+  end
 end
 
 class Store < ActiveRecord::Base
@@ -96,5 +119,9 @@ class Song < ActiveRecord::Base
 end
 
 class Band < ActiveRecord::Base
-  default_scope { where(name: "Test") }
+  default_scope { where(active: true).order(:name) }
+end
+
+class Artist < ActiveRecord::Base
+  default_scope { where(active: true).order(:name) }
 end

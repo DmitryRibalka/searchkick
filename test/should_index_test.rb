@@ -7,7 +7,7 @@ class ShouldIndexTest < Minitest::Test
   end
 
   def test_default_true
-    assert Animal.new.should_index?
+    assert Store.new.should_index?
   end
 
   def test_change_to_true
@@ -39,7 +39,6 @@ class ShouldIndexTest < Minitest::Test
     end
     Product.where(id: product.id).reindex
     Product.searchkick_index.refresh
-    # TODO fix in Searchkick 5
-    # assert_search "index", []
+    assert_search "index", []
   end
 end

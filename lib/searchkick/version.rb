@@ -1,3 +1,3 @@
 module Searchkick
-  VERSION = "4.6.0"
+  VERSION = "5.4.0"
 end

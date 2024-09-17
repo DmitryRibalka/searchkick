@@ -34,8 +34,6 @@ class MatchTest < Minitest::Test
   end
 
   def test_percent
-    # Note: "2% Milk" doesn't get matched in ES below 5.1.1
-    # This could be a bug since it has an edit distance of 1
     store_names ["1% Milk", "Whole Milk"]
     assert_search "1%", ["1% Milk"]
   end
@@ -61,8 +59,8 @@ class MatchTest < Minitest::Test
   end
 
   def test_stemming_tokens
-    assert_equal ["milk"], Product.search_index.tokens("milks", analyzer: "searchkick_search")
-    assert_equal ["milk"], Product.search_index.tokens("milks", analyzer: "searchkick_search2")
+    assert_equal ["milk"], Product.searchkick_index.tokens("milks", analyzer: "searchkick_search")
+    assert_equal ["milk"], Product.searchkick_index.tokens("milks", analyzer: "searchkick_search2")
   end
 
   # fuzzy
@@ -227,6 +225,7 @@ class MatchTest < Minitest::Test
   end
 
   def test_dynamic_fields
+    setup_speaker
     store_names ["Red Bull"], Speaker
     assert_search "redbull", ["Red Bull"], {fields: [:name]}, Speaker
   end
@@ -264,6 +263,8 @@ class MatchTest < Minitest::Test
     assert_search "fresh honey", ["fresh", "honey"], {operator: "or"}
     assert_search "fresh honey", [], {operator: "and"}
     assert_search "fresh honey", ["fresh", "honey"], {operator: :or}
+    assert_search "fresh honey", ["fresh", "honey"], {operator: :or, body_options: {track_total_hits: true}}
+    assert_search "fresh honey", [], {operator: :or, fields: [:name], match: :phrase, body_options: {track_total_hits: true}}
   end
 
   def test_operator_scoring

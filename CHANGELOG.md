@@ -1,6 +1,125 @@
-## 4.6.1 (unreleased)
+## 5.4.0 (2024-09-04)
+
+- Added `knn` option
+- Added `rrf` method
+- Added experimental support for scripting to `where` option
+- Added warning for `exists` with non-`true` values
+- Added warning for full reindex and `:queue` mode
+- Fixed `per_page` method when paginating beyond `max_result_window`
+- Dropped support for Ruby < 3.1
+
+## 5.3.1 (2023-11-28)
+
+- Fixed error with misspellings below and failed queries
+
+## 5.3.0 (2023-07-02)
+
+- Fixed error with `cutoff_frequency`
+- Dropped support for Ruby < 3 and Active Record < 6.1
+- Dropped support for Mongoid < 7
+
+## 5.2.4 (2023-05-11)
+
+- Fixed error with non-string routing and `:async` mode
+
+## 5.2.3 (2023-04-12)
+
+- Fixed error with missing records and multiple models
+
+## 5.2.2 (2023-04-01)
+
+- Fixed `total_docs` method
+- Fixed deprecation warning with Active Support 7.1
+
+## 5.2.1 (2023-02-21)
+
+- Added support for `redis-client` gem
+
+## 5.2.0 (2023-02-08)
+
+- Added model name to warning about missing records
+- Fixed unnecessary data loading when reindexing relations with `:async` and `:queue` modes
+
+## 5.1.2 (2023-01-29)
+
+- Fixed error with missing point in time
+
+## 5.1.1 (2022-12-05)
+
+- Added support for strings for `offset` and `per_page`
+
+## 5.1.0 (2022-10-12)
+
+- Added support for fractional search timeout
+- Fixed search timeout with `elasticsearch` 8+ and `opensearch-ruby` gems
+- Fixed search timeout not applying to `multi_search`
+
+## 5.0.5 (2022-10-09)
+
+- Added `model` method to `Searchkick::Relation`
+- Fixed deprecation warning with `redis` gem
+- Fixed `respond_to?` method on relation loading relation
+- Fixed `Relation loaded` error for non-mutating methods on relation
+
+## 5.0.4 (2022-06-16)
+
+- Added `max_result_window` option
+- Improved error message for unsupported versions of Elasticsearch
+
+## 5.0.3 (2022-03-13)
+
+- Fixed context for index name for inherited models
+
+## 5.0.2 (2022-03-03)
+
+- Fixed index name for inherited models
+
+## 5.0.1 (2022-02-27)
+
+- Prefer `mode: :async` over `async: true` for full reindex
+- Fixed instance method overriding with concerns
+
+## 5.0.0 (2022-02-21)
+
+- Searches now use lazy loading (similar to Active Record)
+- Added `unscope` option to better support working with default scopes
+- Added support for `:async` and `:queue` modes for `reindex` on relation
+- Added basic protection from unfiltered parameters to `where` option
+- Added `models` option to `similar` method
+- Changed async full reindex to fetch ids instead of using ranges for numeric primary keys with Active Record
+- Changed `searchkick_index_options` to return symbol keys (instead of mix of strings and symbols)
+- Changed non-anchored regular expressions to match expected results (previously warned)
+- Changed record reindex to return `true` to match model and relation reindex
+- Updated async reindex job to call `search_import` for nested associations
+- Fixed removing records when `should_index?` is `false` when `reindex` called on relation
+- Fixed issue with `merge_mappings` for fields that use `searchkick` options
+- Raise error when `search` called on relations
+- Raise `ArgumentError` (instead of warning) for invalid regular expression modifiers
+- Raise `ArgumentError` instead of `RuntimeError` for unknown operators
+- Removed mapping of `id` to `_id` with `order` option (not supported in Elasticsearch 8)
+- Removed `wordnet` option (no longer worked)
+- Removed dependency on `elasticsearch` gem (can use `elasticsearch` or `opensearch-ruby`)
+- Dropped support for Elasticsearch 6
+- Dropped support for Ruby < 2.6 and Active Record < 5.2
+- Dropped support for NoBrainer and Cequel
+- Dropped support for `faraday_middleware-aws-signers-v4` (use `faraday_middleware-aws-sigv4` instead)
+
+## 4.6.3 (2021-11-19)
+
+- Added support for reloadable synonyms for OpenSearch
+- Added experimental support for `opensearch-ruby` gem
+- Removed `elasticsearch-xpack` dependency for reloadable synonyms
+
+## 4.6.2 (2021-11-15)
+
+- Added support for beginless ranges to `where` option
+- Fixed `like` and `ilike` with `+` character
+- Fixed warning about accessing system indices when no model or index specified
+
+## 4.6.1 (2021-09-25)
 
 - Added `ilike` operator for Elasticsearch 7.10+
+- Fixed missing methods with `multi_search`
 
 ## 4.6.0 (2021-08-22)
 
